@@ -1,23 +1,31 @@
 // ============================================================
 // CONFIG
 // ============================================================
-const PROCESSED_LABEL = "AutoCat/Processed";
-const BATCH_SIZE = 20;
-const LLM_MODEL = "gemma-3-27b-it";
-const BODY_SNIPPET_LENGTH = 100; // chars — enough context, minimal privacy exposure
+const PROCESSED_LABEL = "Processed";
+const BATCH_SIZE = 5;
+const DELAY_BETWEEN_CALLS_MS = 4000;
+const LLM_MODEL = "gemini-3.1-flash-lite-preview";
 
 const CATEGORIES = {
-  "High Priority":   { starEmail: true,  markRead: false, archive: false },
-  "College":         { starEmail: false, markRead: false, archive: false },
-  "School":          { starEmail: false, markRead: false, archive: false },
-  "Placement/Jobs":  { starEmail: false, markRead: false, archive: false },
-  "Finance":         { starEmail: false, markRead: false, archive: false },
-  "Security/Logins": { starEmail: false, markRead: false, archive: false },
-  "OTPs":            { starEmail: false, markRead: true,  archive: true  },
-  "Newsletters":     { starEmail: false, markRead: true,  archive: true  },
-  "Promotions":      { starEmail: false, markRead: true,  archive: true  },
-  "Social Media":    { starEmail: false, markRead: true,  archive: true  },
-  "Other":           { starEmail: false, markRead: false, archive: false  }
+  "High Priority":      { markRead: false, archive: false },
+  "College":            { markRead: false, archive: false },
+  "School":             { markRead: false, archive: false },
+  "Placement/Jobs":     { markRead: false, archive: false },
+  "Finance":            { markRead: false, archive: false },
+  "Security/Logins":    { markRead: false, archive: false },
+  "OTPs":               { markRead: true,  archive: true  },
+  "Newsletters":        { markRead: true,  archive: true  },
+  "Promotions":         { markRead: true,  archive: true  },
+  "Social Media":       { markRead: true,  archive: true  },
+  "Travel":             { markRead: false, archive: false },
+  "Shopping/Orders":    { markRead: false, archive: false },
+  "Events":             { markRead: false, archive: false },
+  "Health":             { markRead: false, archive: false },
+  "Government/Legal":   { markRead: false, archive: false },
+  "Subscriptions":      { markRead: true,  archive: true  },
+  "Support/Tickets":    { markRead: false, archive: false },
+  "Referrals/Rewards":  { markRead: true,  archive: true  },
+  "Other":              { markRead: false, archive: false }
 };
 
 // ============================================================
@@ -30,7 +38,7 @@ function autoCategorizeEmails() {
   const processedLabel = getOrCreateLabel(PROCESSED_LABEL);
 
   const threads = GmailApp.search(
-    `in:inbox is:unread -label:"${PROCESSED_LABEL}"`,
+    `in:inbox -label:"${PROCESSED_LABEL}"`,
     0,
     BATCH_SIZE
   );
@@ -39,23 +47,21 @@ function autoCategorizeEmails() {
 
   threads.forEach(thread => {
     try {
-      // Skip if already categorized AND processed
       const existingLabels = thread.getLabels().map(l => l.getName());
       const alreadyCategorized = existingLabels.some(l => Object.keys(CATEGORIES).includes(l));
       const alreadyProcessed = existingLabels.includes(PROCESSED_LABEL);
 
-      if (alreadyCategorized && alreadyProcessed) return; // truly done, skip
+      if (alreadyCategorized && alreadyProcessed) return;
 
       const messages = thread.getMessages();
-      const message = messages[0]; // First message — best original context
+      const message = messages[0];
 
-      // Extract a short body snippet, stripping quoted replies and extra whitespace
-      const bodySnippet = extractBodySnippet(message.getPlainBody());
+      const fullBody = extractCleanBody(message.getPlainBody());
 
-      const category = classifyWithGemma(
+      const category = classifyWithGemini(
         message.getFrom(),
         message.getSubject(),
-        bodySnippet,
+        fullBody,
         apiKey
       );
 
@@ -66,55 +72,89 @@ function autoCategorizeEmails() {
     } catch (error) {
       Logger.log(`Error processing thread: ${error}`);
     }
+
+    Utilities.sleep(DELAY_BETWEEN_CALLS_MS);
   });
 
   Logger.log("Done!");
 }
 
 // ============================================================
-// BODY SNIPPET EXTRACTOR
-// Strips quoted replies (lines starting with >) and collapses
-// whitespace, then trims to BODY_SNIPPET_LENGTH characters.
+// BODY CLEANER
 // ============================================================
-function extractBodySnippet(plainBody) {
+function extractCleanBody(plainBody) {
   if (!plainBody) return "";
 
-  const cleaned = plainBody
-    .split("\n")
-    .filter(line => !line.trim().startsWith(">"))  // strip quoted reply lines
-    .join(" ")
-    .replace(/\s+/g, " ")                           // collapse whitespace
-    .trim();
+  const lines = plainBody.split("\n");
+  const cleaned = [];
+  let signatureStarted = false;
 
-  return cleaned.substring(0, BODY_SNIPPET_LENGTH);
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (trimmed === "--" || trimmed === "—" || trimmed.match(/^_{3,}$/)) {
+      signatureStarted = true;
+    }
+    if (signatureStarted) continue;
+    if (trimmed.startsWith(">")) continue;
+    if (trimmed.match(/^On .+ wrote:$/)) continue;
+
+    cleaned.push(line);
+  }
+
+  return cleaned
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // ============================================================
-// GEMMA 3 27B CLASSIFIER (sender + subject + 100-char snippet)
+// GEMINI 3.1 FLASH CLASSIFIER
 // ============================================================
-function classifyWithGemma(from, subject, bodySnippet, apiKey) {
+function classifyWithGemini(from, subject, fullBody, apiKey) {
   const categoryList = Object.keys(CATEGORIES).join(" | ");
 
-  const prompt = `Classify this email into exactly one category. Reply with ONLY the category name, nothing else.
+  const prompt = `You are a strict email classifier. Your only job is to output exactly one category name from the list below. No explanation. No punctuation. No extra words. Just the category name.
 
-Categories: ${categoryList}
+CATEGORIES: ${categoryList}
 
-Definitions:
-- High Priority: Urgent email from a real person needing immediate action (boss, manager, HR, professor, deadline-related)
-- College: University or college administration, exams, fees, results, attendance, hall tickets (.ac.in or .edu senders)
-- School: School teachers, principal, assignments, tests, report cards, parent meetings
-- Placement/Jobs: Job offers, internships, interview calls, campus recruitment, LinkedIn job alerts, Naukri, Indeed
-- Finance: Bank transactions, UPI payments (GPay, PhonePe, Paytm), invoices, receipts, refunds, credit/debit alerts
-- Security/Logins: Login alerts, password reset requests, unusual account activity, 2FA setup emails
-- OTPs: One-time passwords, verification codes, authentication codes (usually very short subjects like "OTP" or "Your code")
-- Newsletters: Blog digests, weekly roundups, subscription content, editorial emails
-- Promotions: Sales, discounts, coupons, % off offers, marketing emails, flash sales, shop now
-- Social Media: Facebook, Instagram, Twitter/X, LinkedIn activity notifications (likes, comments, followers)
-- Other: Personal emails, replies, or anything that doesn't clearly fit the above
+DEFINITIONS:
+- High Priority: A real human personally wrote this to YOU and needs a response. Must be hand-written, direct, personal. NOT automated. NOT bulk. NOT system-generated.
+- College: University/college admin, faculty, or portals — exams, fees, results, attendance, timetables, hall tickets. Senders end in .ac.in or .edu.
+- School: School teachers, principal, school portals — assignments, tests, report cards, PTM, school fee reminders.
+- Placement/Jobs: Job offers, internship offers, interview calls, aptitude tests, campus drives, job alerts from LinkedIn, Naukri, Indeed, Internshala, Unstop, Superset.
+- Finance: Bank transaction alerts, UPI confirmations (GPay/PhonePe/Paytm), credit/debit card alerts, loan EMIs, investment/mutual fund statements, invoices, refunds. Senders: HDFC, SBI, ICICI, Axis, Zerodha, Groww, SBM, Niyo.
+- Security/Logins: Login attempt alerts, password reset, account recovery, suspicious sign-in, 2FA setup, device authorization. NOT OTPs.
+- OTPs: Email contains a one-time numeric code for immediate use. Short email. Subject has "OTP", "code", "verify", or a number.
+- Newsletters: Subscribed editorial content — blog digests, weekly roundups, creator newsletters, thought leadership. Sent on schedule to many.
+- Promotions: Bulk marketing — discounts, sales, coupons, offers, "shop now", brand campaigns. NOT for services you pay for.
+- Social Media: Automated notifications from Facebook, Instagram, Twitter/X, LinkedIn, YouTube, Snapchat, Reddit — likes, comments, followers, mentions.
+- Travel: Train/flight/bus bookings, hotel reservations, cab receipts, PNR confirmations, boarding passes, travel insurance, trip itineraries. Senders: IRCTC, MakeMyTrip, GoIbibo, EaseMyTrip, Ola, Uber, Airbnb, redBus, Royal Sundaram travel policy.
+- Shopping/Orders: Order placed, payment success, shipping, delivery, return/exchange updates. Senders: Amazon, Flipkart, Myntra, Meesho, Swiggy, Blinkit, Zepto, Nykaa, Ajio.
+- Events: Webinar registrations, conference invites, workshop reminders, concert/movie tickets, hackathons, virtual event links.
+- Health: Doctor appointments, lab reports, pharmacy orders, hospital bills, health insurance claims, diagnostic emails.
+- Government/Legal: Government portals — Aadhaar, PAN, DigiLocker, income tax, GST, passport, EPFO, legal notices, RTI.
+- Subscriptions: Renewal reminders and billing for services you already pay for — Netflix, Spotify, YouTube Premium, Amazon Prime, iCloud, Adobe, Notion, any SaaS.
+- Support/Tickets: Customer support replies, helpdesk ticket updates, complaint acknowledgements, resolution emails.
+- Referrals/Rewards: Referral bonus, cashback earned, loyalty points, reward redemption, scratch card, milestone rewards.
+- Other: Truly ambiguous emails that fit none of the above. Use as last resort only.
+
+STRICT RULES — follow these before deciding:
+1. If the email is from IRCTC, MakeMyTrip, GoIbibo, EaseMyTrip, redBus, Ola, Uber, Airbnb, or mentions PNR/train/flight/hotel → ALWAYS Travel.
+2. If the email mentions a bank transaction, UPI payment, credit/debit alert, or account statement → ALWAYS Finance.
+3. If the sender is a bank (HDFC, SBI, ICICI, Axis, SBM, Niyo, Kotak, Yes Bank) → Finance (unless it's a login alert → Security/Logins).
+4. If the subject contains "Transaction Alert", "Debited", "Credited", "Statement", "e-Statement" → ALWAYS Finance.
+5. If it's an insurance policy for travel (Royal Sundaram, Bajaj Allianz travel policy, etc.) → ALWAYS Travel.
+6. If the sender is Superset, LinkedIn, Naukri, Indeed, Internshala → ALWAYS Placement/Jobs.
+7. Automated system emails are NEVER High Priority — even if subject says "urgent" or "important".
+8. OTPs and Security/Logins are different — OTPs have a numeric code in the body; Security/Logins are about account activity alerts.
+9. Subscriptions are for services you PAY for. Promotions are unsolicited marketing.
+10. When two categories seem valid, always pick the MORE SPECIFIC one.
 
 FROM: ${from}
 SUBJECT: ${subject}
-BODY PREVIEW: ${bodySnippet}
+FULL BODY:
+${fullBody}
 
 Category:`;
 
@@ -123,12 +163,11 @@ Category:`;
   const payload = {
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: {
-      temperature: 0.05,  // Near-deterministic output
-      maxOutputTokens: 15 // Only need the label name
+      temperature: 0.0,
+      maxOutputTokens: 15
     }
   };
 
-  // Retry up to 3 times with exponential backoff
   const MAX_RETRIES = 3;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -143,13 +182,12 @@ Category:`;
 
       if (json.error) {
         Logger.log(`API Error (attempt ${attempt}): ${json.error.message}`);
-        if (attempt < MAX_RETRIES) Utilities.sleep(1000 * attempt); // 1s, 2s backoff
+        if (attempt < MAX_RETRIES) Utilities.sleep(1000 * attempt);
         continue;
       }
 
       const raw = json.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
 
-      // Match against valid categories (handles minor formatting variations)
       const matched = Object.keys(CATEGORIES).find(cat =>
         raw.toLowerCase().includes(cat.toLowerCase())
       );
@@ -162,7 +200,7 @@ Category:`;
     }
   }
 
-  return "Other"; // All retries exhausted
+  return "Other";
 }
 
 // ============================================================
@@ -173,9 +211,8 @@ function applyCategory(thread, category) {
   const label = getOrCreateLabel(category);
 
   thread.addLabel(label);
-  if (config.starEmail) thread.star();
-  if (config.markRead)  thread.markRead();
-  if (config.archive)   thread.moveToArchive();
+  if (config.markRead) thread.markRead();
+  if (config.archive)  thread.moveToArchive();
 }
 
 // ============================================================
